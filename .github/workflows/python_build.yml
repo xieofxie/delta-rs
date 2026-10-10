@@ -18,8 +18,11 @@ env:
 
 jobs:
   check-windows-python-dependencies:
-    name: Python Windows dependency graph
+    name: Python Windows dependency graph (${{ matrix.target }})
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [x86_64-pc-windows-msvc, aarch64-pc-windows-msvc]
     defaults:
       run:
         working-directory: .
@@ -32,7 +35,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tree=$(cargo tree -p deltalake-python --target x86_64-pc-windows-msvc)
+          tree=$(cargo tree -p deltalake-python --target ${{ matrix.target }})
 
           if grep -Eq '(^|[[:space:]])openssh v' <<<"$tree"; then
             printf '%s\n' "$tree"
@@ -45,6 +48,92 @@ jobs:
             printf '%s\n' "OpenDAL SFTP must not be selected for the Windows Python target"
             exit 1
           fi
+
+  test-windows-wheel:
+    name: Python Windows wheel (${{ matrix.architecture }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            architecture: x64
+            target: x86_64-pc-windows-msvc
+            wheel-platform: win_amd64
+          - runner: windows-11-arm
+            architecture: arm64
+            target: aarch64-pc-windows-msvc
+            wheel-platform: win_arm64
+    runs-on: ${{ matrix.runner }}
+    env:
+      # This job does not use setup-builder, which installs sccache.
+      RUSTC_WRAPPER: ""
+      WHEEL_PLATFORM: ${{ matrix.wheel-platform }}
+    steps:
+      # v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      # <https://github.com/actions/setup-python/releases/tag/v6.2.0>
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: '3.11'
+          architecture: ${{ matrix.architecture }}
+
+      - name: Configure ARM64 native compiler
+        if: matrix.architecture == 'arm64'
+        shell: pwsh
+        run: |
+          $llvm = "$env:ProgramFiles\LLVM\bin"
+          if (!(Test-Path "$llvm\clang.exe") -or !(Test-Path "$llvm\clang-cl.exe")) {
+            throw "LLVM clang and clang-cl are required for Windows ARM64"
+          }
+          $llvm >> $env:GITHUB_PATH
+          "CC_aarch64_pc_windows_msvc=clang-cl" >> $env:GITHUB_ENV
+          "CXX_aarch64_pc_windows_msvc=clang-cl" >> $env:GITHUB_ENV
+
+      - name: Build wheel
+        # <https://github.com/PyO3/maturin-action/releases/tag/v1.50.1>
+        uses: messense/maturin-action@04ac600d27cdf7a9a280dadf7147097c42b757ad
+        with:
+          target: ${{ matrix.target }}
+          rust-toolchain: stable
+          command: build
+          args: -m python/Cargo.toml --interpreter python --profile ci --out target/wheels
+
+      - name: Install wheel and runtime dependencies
+        shell: pwsh
+        run: |
+          $wheels = @(Get-ChildItem "..\target\wheels\deltalake-*-cp311-abi3-$env:WHEEL_PLATFORM.whl")
+          if ($wheels.Count -ne 1) {
+            throw "Expected exactly one cp311-abi3-$env:WHEEL_PLATFORM wheel, found $($wheels.Count)"
+          }
+          python -m pip install --only-binary=:all: $wheels[0].FullName
+
+      - name: Smoke test installed wheel without optional dependencies
+        working-directory: ${{ runner.temp }}
+        shell: python
+        run: |
+          import os
+          import sysconfig
+          from pathlib import Path
+          from tempfile import TemporaryDirectory
+
+          from arro3.core import Array, DataType, Table
+          from deltalake import DeltaTable, QueryBuilder, write_deltalake
+
+          assert sysconfig.get_platform().replace("-", "_") == os.environ["WHEEL_PLATFORM"]
+          data = Table.from_pydict({"id": Array([1, 2, 3], DataType.int64())})
+          with TemporaryDirectory() as directory:
+              path = Path(directory) / "table"
+              write_deltalake(path, data)
+              write_deltalake(path, data, mode="append")
+              table = DeltaTable(path)
+              assert table.version() == 1
+              result = (
+                  QueryBuilder()
+                  .register("test_table", table)
+                  .execute("SELECT id FROM test_table ORDER BY id")
+                  .read_all()
+              )
+              assert result["id"].to_pylist() == [1, 1, 2, 2, 3, 3]
 
   test-minimal:
     runs-on: ubuntu-latest
